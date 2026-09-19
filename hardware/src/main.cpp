@@ -1,142 +1,87 @@
 #include <Arduino.h>
 #include <ESP32Servo.h>
 
-constexpr int PIN_TRIG = 5;
-constexpr int PIN_ECHO = 18;
-constexpr int PIN_SERVO = 13;
+#define TRIG_PIN 5
+#define ECHO_PIN 18
+#define SERVO_PIN 13
 
-constexpr float DISTANCE_THRESHOLD_CM = 20.0f;
-constexpr unsigned long HOLD_OPEN_MS = 3000;
-constexpr unsigned long SENSOR_INTERVAL_MS = 60;
+Servo servo;
 
-constexpr int ANGLE_CLOSED = 0;
-constexpr int ANGLE_OPEN = 90;
-constexpr int STEP_DELAY_MS = 15;
+bool isOpen = false;
+unsigned long leaveTime = 0;
 
-enum class BinState {
-  CLOSED,
-  OPENING,
-  OPEN,
-  CLOSING
-};
-
-Servo binServo;
-BinState currentState = BinState::CLOSED;
-
-int currentAngle = ANGLE_CLOSED;
-unsigned long lastSensorReadTime = 0;
-unsigned long lastServoStepTime = 0;
-unsigned long lastHandSeenTime = 0;
-float currentDistanceCm = -1.0f;
-
-float measureDistance() {
-  digitalWrite(PIN_TRIG, LOW);
+float getDistance() {
+  // Send trigger pulse
+  digitalWrite(TRIG_PIN, LOW);
   delayMicroseconds(2);
-  digitalWrite(PIN_TRIG, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(PIN_TRIG, LOW);
 
-  unsigned long duration = pulseIn(PIN_ECHO, HIGH, 30000);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  // Read echo duration
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
 
   if (duration == 0) {
-    return -1.0f;
+    return -1;
   }
 
-  return (duration * 0.0343f) / 2.0f;
-}
-
-void stepServoTowards(int targetAngle, BinState nextStateWhenDone) {
-  unsigned long now = millis();
-  if (now - lastServoStepTime >= STEP_DELAY_MS) {
-    lastServoStepTime = now;
-    if (currentAngle < targetAngle) {
-      currentAngle++;
-      binServo.write(currentAngle);
-    } else if (currentAngle > targetAngle) {
-      currentAngle--;
-      binServo.write(currentAngle);
-    }
-    if (currentAngle == targetAngle) {
-      currentState = nextStateWhenDone;
-    }
-  }
-}
-
-void updateStateMachine() {
-  unsigned long now = millis();
-  bool handDetected = (currentDistanceCm > 0.0f && currentDistanceCm <= DISTANCE_THRESHOLD_CM);
-
-  switch (currentState) {
-  case BinState::CLOSED:
-    if (handDetected) {
-      Serial.printf("[EVENT] Object detected at %.1f cm! Opening lid...\n", currentDistanceCm);
-      currentState = BinState::OPENING;
-    }
-    break;
-
-  case BinState::OPENING:
-    stepServoTowards(ANGLE_OPEN, BinState::OPEN);
-    if (currentState == BinState::OPEN) {
-      lastHandSeenTime = now;
-      Serial.println("[STATE] Lid fully OPEN.");
-    }
-    break;
-
-  case BinState::OPEN:
-    if (handDetected) {
-      lastHandSeenTime = now;
-    } else if (now - lastHandSeenTime >= HOLD_OPEN_MS) {
-      Serial.println("[EVENT] Hold timer expired. Closing lid...");
-      currentState = BinState::CLOSING;
-    }
-    break;
-
-  case BinState::CLOSING:
-    if (handDetected) {
-      Serial.printf("[SAFETY] Hand detected at %.1f cm while closing! Reopening...\n", currentDistanceCm);
-      currentState = BinState::OPENING;
-      break;
-    }
-    stepServoTowards(ANGLE_CLOSED, BinState::CLOSED);
-    if (currentState == BinState::CLOSED) {
-      Serial.println("[STATE] Lid fully CLOSED.");
-    }
-    break;
-  }
+  // Convert to centimeters
+  return duration * 0.0343 / 2;
 }
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
 
-  pinMode(PIN_TRIG, OUTPUT);
-  pinMode(PIN_ECHO, INPUT);
-  digitalWrite(PIN_TRIG, LOW);
+  servo.attach(SERVO_PIN);
 
-  ESP32PWM::allocateTimer(0);
-  ESP32PWM::allocateTimer(1);
-  ESP32PWM::allocateTimer(2);
-  ESP32PWM::allocateTimer(3);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
 
-  binServo.setPeriodHertz(50);
-  binServo.attach(PIN_SERVO, 500, 2400);
+  servo.write(0);
 
-  currentAngle = ANGLE_CLOSED;
-  binServo.write(currentAngle);
-
-  Serial.printf("[SETUP] Servo attached to GPIO %d, set to %d deg\n", PIN_SERVO, ANGLE_CLOSED);
-  Serial.printf("[SETUP] Ultrasonic TRIG: GPIO %d, ECHO: GPIO %d\n", PIN_TRIG, PIN_ECHO);
-  Serial.printf("[SETUP] Threshold: %.1f cm, Hold Open: %lu ms\n", DISTANCE_THRESHOLD_CM, HOLD_OPEN_MS);
-  Serial.println("[SETUP] Ready!\n");
+  Serial.println("Lid: CLOSED");
 }
 
 void loop() {
-  unsigned long now = millis();
+  float distance = getDistance();
 
-  if (now - lastSensorReadTime >= SENSOR_INTERVAL_MS) {
-    lastSensorReadTime = now;
-    currentDistanceCm = measureDistance();
+  // Distance debugging
+  if (distance < 0) {
+    Serial.println("Distance: OUT OF RANGE");
+  } else {
+    Serial.print("Distance: ");
+    Serial.print(distance);
+    Serial.println(" cm");
   }
 
-  updateStateMachine();
+  // Person detected
+  if (distance >= 0 && distance <= 10) {
+    if (!isOpen) {
+      servo.write(90);
+      isOpen = true;
+      Serial.println("Lid: OPEN");
+    }
+    // Reset closing timer
+    leaveTime = 0;
+  }
+
+  // Person no longer detected
+  else if (isOpen) {
+    // Start closing timer
+    if (leaveTime == 0) {
+      leaveTime = millis();
+      Serial.println("Person left - closing timer started");
+    }
+
+    // Close after 3 seconds
+    if (millis() - leaveTime >= 3000) {
+      servo.write(0);
+      isOpen = false;
+      leaveTime = 0;
+      Serial.println("Lid: CLOSED");
+    }
+  }
+
+  delay(200);
 }
